@@ -1,0 +1,8 @@
+streamlit
+pandas
+numpy
+spacy
+sckit-learn
+sentence-transformers
+faiss-cpu
+langchain
