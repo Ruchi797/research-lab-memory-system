@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import faiss
+import faiss-cpu
 import re
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
