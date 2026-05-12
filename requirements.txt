@@ -4,5 +4,7 @@ numpy
 spacy
 sckit-learn
 sentence-transformers
+transformers
 faiss-cpu
 langchain
+torch
