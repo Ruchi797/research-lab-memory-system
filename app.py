@@ -1,423 +1,455 @@
-"""
-Streamlit Web App: Research Lab Meeting Memory System
-======================================================
-Run with: streamlit run app/streamlit_app.py
-
-Features:
-- Upload meeting transcripts (paste text or upload file)
-- View extracted insights (keywords, papers, deadlines, NER)
-- Semantic search across all meetings
-- RAG-powered Q&A
-- Cross-meeting trend analysis
-- Downloadable markdown report
-"""
+# Save this file as: app.py
+# Run using:
+# streamlit run app.py
 
 import streamlit as st
-import sys
-import json
-from pathlib import Path
+import pandas as pd
+import numpy as np
+import faiss
+import re
+from datetime import datetime
+from sentence_transformers import SentenceTransformer
+from transformers import pipeline
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.cluster import KMeans
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# =========================================================
+# PAGE CONFIG
+# =========================================================
 
-# Page config
 st.set_page_config(
-    page_title="Research Lab Memory System",
+    page_title="Research Lab Meeting Memory System",
     page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# Custom CSS
+# =========================================================
+# CUSTOM CSS
+# =========================================================
+
 st.markdown("""
 <style>
-    .metric-box {
-        background: #1e1e2e;
-        border: 1px solid #333;
-        border-radius: 8px;
-        padding: 16px;
-        text-align: center;
-    }
-    .chunk-card {
-        background: #16213e;
-        border-left: 3px solid #4c9be8;
-        padding: 10px 14px;
-        margin: 8px 0;
-        border-radius: 4px;
-    }
-    .answer-box {
-        background: #0f3460;
-        border: 1px solid #4c9be8;
-        border-radius: 8px;
-        padding: 16px;
-        margin: 12px 0;
-    }
-    .source-tag {
-        background: #333;
-        padding: 2px 8px;
-        border-radius: 12px;
-        font-size: 0.8em;
-        margin: 2px;
-        display: inline-block;
-    }
+.main-title {
+    font-size: 42px;
+    font-weight: bold;
+    color: #4F46E5;
+}
+
+.card {
+    padding: 1rem;
+    border-radius: 12px;
+    background-color: #F9FAFB;
+    margin-bottom: 1rem;
+    border-left: 5px solid #4F46E5;
+}
+
+.keyword {
+    display: inline-block;
+    background-color: #E0E7FF;
+    padding: 5px 10px;
+    border-radius: 15px;
+    margin: 4px;
+    color: #3730A3;
+    font-size: 14px;
+}
+
+.answer-box {
+    background-color: #ECFDF5;
+    padding: 1rem;
+    border-radius: 10px;
+    border-left: 5px solid #10B981;
+}
 </style>
 """, unsafe_allow_html=True)
 
+# =========================================================
+# HEADER
+# =========================================================
 
-@st.cache_resource
-def load_system():
-    """Load and cache the ResearchLabMemorySystem (expensive — runs once)."""
-    from main import ResearchLabMemorySystem
-    return ResearchLabMemorySystem(
-        embedding_model="all-MiniLM-L6-v2",
-        use_api=False
-    )
+st.markdown('<div class="main-title">🧠 Research Lab Meeting Memory System</div>', unsafe_allow_html=True)
 
+st.write("AI-powered meeting intelligence system using NLP + Semantic Search + RAG")
+
+# =========================================================
+# SAMPLE DATA
+# =========================================================
 
 @st.cache_data
-def ingest_sample_data(_system):
-    """Ingest sample meetings (cached so it only runs once)."""
-    from data.sample_meetings import SAMPLE_MEETINGS
-    return _system.ingest_meetings(SAMPLE_MEETINGS, chunk_level="sentence")
+def load_data():
 
+    meetings = [
+        {
+            "id": "meeting_001",
+            "date": "2026-05-01",
+            "title": "RAG Pipeline Discussion",
+            "transcript": """
+            Today we discussed FAISS vector databases and retrieval augmented generation.
+            Deadline for conference submission is June 10.
+            Research idea includes semantic search optimization.
+            Paper discussed: Attention Is All You Need.
+            """
+        },
 
-def main():
-    # Sidebar
-    with st.sidebar:
-        st.title("🧠 Lab Memory")
-        st.caption("Research Meeting Intelligence System")
-        st.divider()
+        {
+            "id": "meeting_002",
+            "date": "2026-05-04",
+            "title": "Multilingual NLP Meeting",
+            "transcript": """
+            Team explored multilingual BERT and cross-lingual transfer learning.
+            We will perform experiments on Hindi and Marathi datasets.
+            Deadline for experiments is next Friday.
+            """
+        },
 
-        page = st.radio(
-            "Navigation",
-            ["📊 Dashboard", "🔍 Search", "💬 Ask AI", "📈 Trends", "📝 Add Meeting"],
-            label_visibility="collapsed"
+        {
+            "id": "meeting_003",
+            "date": "2026-05-08",
+            "title": "Evaluation Metrics Meeting",
+            "transcript": """
+            Discussion about F1 score, precision, recall and BLEU metrics.
+            We also discussed dashboard visualization for model evaluation.
+            """
+        },
+
+        {
+            "id": "meeting_004",
+            "date": "2026-05-11",
+            "title": "Research Planning Session",
+            "transcript": """
+            Discussed future AI agents and autonomous systems.
+            Team members will work on LangChain pipelines and RAG applications.
+            Important paper: ReAct prompting paper.
+            Deadline for prototype is June 20.
+            """
+        }
+    ]
+
+    return meetings
+
+meetings = load_data()
+
+# =========================================================
+# LOAD MODELS
+# =========================================================
+
+@st.cache_resource
+def load_embedding_model():
+    return SentenceTransformer("all-MiniLM-L6-v2")
+
+@st.cache_resource
+def load_summarizer():
+    return pipeline(
+        "summarization",
+        model="facebook/bart-large-cnn"
+    )
+
+embedder = load_embedding_model()
+summarizer = load_summarizer()
+
+# =========================================================
+# VECTOR DATABASE
+# =========================================================
+
+texts = [m["transcript"] for m in meetings]
+
+embeddings = embedder.encode(texts)
+
+dimension = embeddings.shape[1]
+
+index = faiss.IndexFlatL2(dimension)
+
+index.add(np.array(embeddings).astype("float32"))
+
+# =========================================================
+# SIDEBAR
+# =========================================================
+
+st.sidebar.title("⚙️ Settings")
+
+top_k = st.sidebar.slider(
+    "Search Results",
+    min_value=1,
+    max_value=5,
+    value=3
+)
+
+st.sidebar.markdown("---")
+
+st.sidebar.success(f"✅ Meetings Loaded: {len(meetings)}")
+
+st.sidebar.info(f"🔍 Vector Chunks Indexed: {index.ntotal}")
+
+# =========================================================
+# TABS
+# =========================================================
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📋 Meeting Insights",
+    "🔍 Semantic Search",
+    "💬 RAG Q&A",
+    "📈 Clustering & Trends"
+])
+
+# =========================================================
+# TAB 1
+# =========================================================
+
+with tab1:
+
+    st.subheader("📋 Meeting Insights")
+
+    titles = [m["title"] for m in meetings]
+
+    selected_title = st.selectbox(
+        "Select Meeting",
+        titles
+    )
+
+    meeting = next(
+        m for m in meetings
+        if m["title"] == selected_title
+    )
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+
+        st.markdown("### 📅 Date")
+        st.info(meeting["date"])
+
+        st.markdown("### 📝 Transcript")
+
+        st.markdown(
+            f"""
+            <div class="card">
+            {meeting["transcript"]}
+            </div>
+            """,
+            unsafe_allow_html=True
         )
 
-        st.divider()
-        st.caption("Powered by:")
-        st.caption("• all-MiniLM-L6-v2 embeddings")
-        st.caption("• FAISS vector search")
-        st.caption("• TF-IDF keyword extraction")
-        st.caption("• RAG pipeline")
+    with col2:
 
-        if st.button("🔄 Load Sample Meetings", use_container_width=True):
-            st.session_state.use_sample = True
+        st.markdown("### 📌 AI Summary")
 
-    # Load system
-    with st.spinner("Loading NLP models..."):
-        system = load_system()
+        try:
+            summary = summarizer(
+                meeting["transcript"],
+                max_length=60,
+                min_length=20,
+                do_sample=False
+            )
 
-    # Auto-load sample data
-    if "ingested" not in st.session_state:
-        if st.session_state.get("use_sample") or True:  # Auto-load on first visit
-            with st.spinner("Ingesting sample meetings..."):
-                summary = ingest_sample_data(system)
-                st.session_state.ingested = True
-                st.session_state.summary = summary
+            st.success(summary[0]["summary_text"])
 
-    # ─── DASHBOARD ───────────────────────────────────────────
-    if "Dashboard" in page:
-        st.title("📊 Meeting Intelligence Dashboard")
+        except:
+            st.warning("Summary model loading...")
 
-        # Top metrics
-        if st.session_state.get("ingested"):
-            s = st.session_state.summary
-            col1, col2, col3, col4, col5 = st.columns(5)
-            with col1:
-                st.metric("Meetings", s['meetings_ingested'])
-            with col2:
-                st.metric("Chunks Indexed", s['total_chunks_indexed'])
-            with col3:
-                st.metric("Papers Found", s['total_papers_found'])
-            with col4:
-                st.metric("Deadlines", s['total_deadlines_found'])
-            with col5:
-                st.metric("Mode", s['generation_mode'])
+        st.markdown("### 🏷️ Keywords")
 
-            st.divider()
+        vectorizer = TfidfVectorizer(
+            stop_words="english"
+        )
 
-        # Per-meeting cards
-        st.subheader("Meeting Insights")
-        for pm in system.processed_meetings:
-            insights = system.get_meeting_insights(pm.meeting_id)
-            with st.expander(f"📋 {pm.meeting_id}: {pm.title} | {pm.date}"):
-                col1, col2 = st.columns([1, 1])
+        X = vectorizer.fit_transform(
+            [meeting["transcript"]]
+        )
 
-                with col1:
-                    st.write("**👥 Attendees:**", ", ".join(pm.attendees))
-                    st.write(f"**📝 Words:** {pm.word_count} | **Sentences:** {pm.sentence_count}")
+        keywords = zip(
+            vectorizer.get_feature_names_out(),
+            X.toarray()[0]
+        )
 
-                    if insights:
-                        st.write("**🔑 Keywords:**")
-                        kw_tags = " ".join(
-                            f"`{kw}`" for kw, _ in insights.keywords[:8]
-                        )
-                        st.markdown(kw_tags)
+        sorted_keywords = sorted(
+            keywords,
+            key=lambda x: x[1],
+            reverse=True
+        )[:10]
 
-                with col2:
-                    if insights and insights.papers_cited:
-                        st.write("**📄 Papers Discussed:**")
-                        for p in insights.papers_cited:
-                            st.write(f"  • _{p['title']}_")
+        for word, score in sorted_keywords:
 
-                    if pm.action_items:
-                        st.write("**✅ Action Items:**")
-                        for item in pm.action_items[:3]:
-                            st.write(f"  • {item[:100]}")
+            st.markdown(
+                f'<span class="keyword">{word}</span>',
+                unsafe_allow_html=True
+            )
 
-                if insights and insights.summary_sentences:
-                    st.write("**📌 Summary:**")
-                    for sent in insights.summary_sentences[:2]:
-                        st.info(sent[:200])
+        st.markdown("### ⏰ Deadlines")
 
-        # All papers table
-        st.subheader("📚 All Papers Cited")
-        papers = system.get_all_papers()
-        if papers:
-            import pandas as pd
-            df = pd.DataFrame(papers)[['title', 'authors', 'venue', 'meeting_id', 'date']]
-            st.dataframe(df, use_container_width=True)
+        deadline_pattern = r"(June \d+|next Friday|June \d+)"
 
-        # All deadlines
-        st.subheader("⏰ All Deadlines")
-        deadlines = system.get_all_deadlines()
+        deadlines = re.findall(
+            deadline_pattern,
+            meeting["transcript"]
+        )
+
         if deadlines:
-            df_dl = pd.DataFrame(deadlines)
-            cols = [c for c in ['assignee', 'task', 'date', 'meeting_id'] if c in df_dl.columns]
-            st.dataframe(df_dl[cols], use_container_width=True)
+            for d in deadlines:
+                st.warning(f"📌 {d}")
+        else:
+            st.info("No deadlines found")
 
-        # Download report
-        st.subheader("📥 Export Report")
-        report = system.generate_report()
-        st.download_button(
-            "Download Markdown Report",
-            data=report,
-            file_name="meeting_memory_report.md",
-            mime="text/markdown"
+# =========================================================
+# TAB 2
+# =========================================================
+
+with tab2:
+
+    st.subheader("🔍 Semantic Search")
+
+    query = st.text_input(
+        "Search meetings",
+        placeholder="e.g. multilingual BERT"
+    )
+
+    if st.button("Search"):
+
+        query_embedding = embedder.encode([query])
+
+        distances, indices = index.search(
+            np.array(query_embedding).astype("float32"),
+            top_k
         )
 
-    # ─── SEMANTIC SEARCH ────────────────────────────────────────
-    elif "Search" in page:
-        st.title("🔍 Semantic Search")
-        st.caption("Find relevant content across all meetings using natural language")
+        st.markdown("## 📚 Results")
 
-        query = st.text_input(
-            "Search query",
-            placeholder="e.g., transformer attention mechanism for multimodal learning"
-        )
+        for idx in indices[0]:
 
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            top_k = st.slider("Number of results", 3, 10, 5)
-        with col2:
-            meeting_filter = st.selectbox(
-                "Filter by meeting",
-                ["All"] + [pm.meeting_id for pm in system.processed_meetings]
+            result = meetings[idx]
+
+            st.markdown(
+                f"""
+                <div class="card">
+                <h4>{result['title']}</h4>
+                <b>Date:</b> {result['date']} <br><br>
+                {result['transcript']}
+                </div>
+                """,
+                unsafe_allow_html=True
             )
 
-        if query:
-            filter_id = None if meeting_filter == "All" else meeting_filter
-            with st.spinner("Searching..."):
-                results = system.search(query, top_k=top_k, filter_meeting_id=filter_id)
+# =========================================================
+# TAB 3
+# =========================================================
 
-            st.write(f"**{len(results)} results** for: _{query}_")
+with tab3:
 
-            for i, r in enumerate(results, 1):
-                with st.container():
-                    col1, col2, col3 = st.columns([1, 3, 1])
-                    with col1:
-                        st.write(f"**#{i}**")
-                        st.metric("Score", f"{r['score']:.3f}")
-                    with col2:
-                        st.write(f"**{r.get('meeting_id')}** | {r.get('date', '')} | {r.get('title', '')[:50]}")
-                        st.write(r['text'][:300])
-                    with col3:
-                        st.caption(f"Type: {r.get('chunk_type', '')}")
-                        if r.get('speaker'):
-                            st.caption(f"Speaker: {r['speaker']}")
-                    st.divider()
+    st.subheader("💬 Ask Questions Across Meetings")
 
-        # Quick examples
-        st.subheader("Try these searches:")
-        example_queries = [
-            "RAG retrieval augmented generation",
-            "cross-modal attention multimodal",
-            "conference deadline submission",
-            "FAISS vector database",
-            "sentiment analysis accuracy benchmark"
+    question = st.text_area(
+        "Enter your question",
+        placeholder="What deadlines were discussed?"
+    )
+
+    if st.button("Generate Answer"):
+
+        question_embedding = embedder.encode([question])
+
+        distances, indices = index.search(
+            np.array(question_embedding).astype("float32"),
+            2
+        )
+
+        retrieved_docs = []
+
+        for idx in indices[0]:
+            retrieved_docs.append(
+                meetings[idx]["transcript"]
+            )
+
+        context = "\n".join(retrieved_docs)
+
+        answer = f"""
+        Based on retrieved meetings:
+
+        {context}
+        """
+
+        st.markdown(
+            f"""
+            <div class="answer-box">
+            {answer}
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+# =========================================================
+# TAB 4
+# =========================================================
+
+with tab4:
+
+    st.subheader("📈 Semantic Clustering")
+
+    num_clusters = st.slider(
+        "Number of Clusters",
+        2,
+        4,
+        2
+    )
+
+    kmeans = KMeans(
+        n_clusters=num_clusters,
+        random_state=42
+    )
+
+    cluster_labels = kmeans.fit_predict(embeddings)
+
+    cluster_df = pd.DataFrame({
+        "Meeting": [m["title"] for m in meetings],
+        "Cluster": cluster_labels
+    })
+
+    st.dataframe(cluster_df)
+
+    st.markdown("### 🔁 Cluster Insights")
+
+    for cluster in sorted(cluster_df["Cluster"].unique()):
+
+        st.markdown(f"## Cluster {cluster}")
+
+        cluster_meetings = cluster_df[
+            cluster_df["Cluster"] == cluster
         ]
-        cols = st.columns(len(example_queries))
-        for i, eq in enumerate(example_queries):
-            with cols[i]:
-                if st.button(eq, key=f"eq_{i}", use_container_width=True):
-                    st.session_state.search_query = eq
-                    st.rerun()
 
-    # ─── RAG Q&A ────────────────────────────────────────────────
-    elif "Ask AI" in page:
-        st.title("💬 Ask AI About Your Meetings")
-        st.caption("RAG-powered Q&A grounded in your meeting records")
+        for m in cluster_meetings["Meeting"]:
+            st.success(m)
 
-        # Chat history
-        if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
+# =========================================================
+# ADD NEW MEETING
+# =========================================================
 
-        # Display chat
-        for msg in st.session_state.chat_history:
-            with st.chat_message(msg["role"]):
-                st.write(msg["content"])
-                if msg["role"] == "assistant" and "sources" in msg:
-                    st.caption(f"Sources: {', '.join(msg['sources'])}")
+st.markdown("---")
 
-        # Input
-        question = st.chat_input("Ask anything about the meetings...")
+st.subheader("➕ Add New Meeting")
 
-        if question:
-            st.session_state.chat_history.append({"role": "user", "content": question})
+with st.form("meeting_form"):
 
-            with st.chat_message("user"):
-                st.write(question)
+    title = st.text_input("Meeting Title")
 
-            with st.chat_message("assistant"):
-                with st.spinner("Retrieving relevant context and generating answer..."):
-                    result = system.ask(question, top_k=5)
+    date = st.date_input("Meeting Date")
 
-                st.write(result.answer)
-                st.caption(f"Sources: {', '.join(result.sources)} | "
-                          f"Confidence: {result.confidence:.0%} | "
-                          f"Mode: {result.generation_mode}")
+    transcript = st.text_area("Transcript")
 
-                # Show retrieved chunks (expandable)
-                with st.expander("📎 Retrieved context chunks"):
-                    for chunk in result.retrieved_chunks[:3]:
-                        st.write(f"**[{chunk['meeting_id']} | Score: {chunk['score']:.3f}]**")
-                        st.write(chunk['text'][:200])
-                        st.divider()
+    submitted = st.form_submit_button("Add Meeting")
 
-            st.session_state.chat_history.append({
-                "role": "assistant",
-                "content": result.answer,
-                "sources": result.sources
-            })
+    if submitted:
 
-        # Suggested questions
-        if not st.session_state.chat_history:
-            st.subheader("Suggested questions:")
-            suggested = [
-                "What papers were discussed about transformers?",
-                "What are all the deadlines across meetings?",
-                "Who is working on the RAG pipeline?",
-                "What datasets are being used in the project?",
-                "What is the target conference and its deadline?",
-                "What are the main research directions of the lab?"
-            ]
-            for i in range(0, len(suggested), 2):
-                col1, col2 = st.columns(2)
-                with col1:
-                    if i < len(suggested):
-                        if st.button(suggested[i], key=f"sq_{i}"):
-                            st.session_state.suggested_q = suggested[i]
-                with col2:
-                    if i + 1 < len(suggested):
-                        if st.button(suggested[i+1], key=f"sq_{i+1}"):
-                            st.session_state.suggested_q = suggested[i+1]
+        new_meeting = {
+            "id": f"meeting_{len(meetings)+1}",
+            "date": str(date),
+            "title": title,
+            "transcript": transcript
+        }
 
-    # ─── TRENDS ────────────────────────────────────────────────
-    elif "Trends" in page:
-        st.title("📈 Cross-Meeting Trends")
-        st.caption("Detect repeated themes, trending topics, and research evolution")
+        meetings.append(new_meeting)
 
-        with st.spinner("Analyzing trends across all meetings..."):
-            try:
-                trends = system.analyze_trends()
-            except Exception as e:
-                st.warning(f"Full clustering unavailable: {e}. Showing basic analysis.")
-                trends = system._basic_trend_analysis()
+        st.success("✅ Meeting Added Successfully!")
 
-        col1, col2 = st.columns(2)
+# =========================================================
+# FOOTER
+# =========================================================
 
-        with col1:
-            st.subheader("🔄 Repeated Themes")
-            st.caption("Topics appearing in 2+ meetings")
-            for theme in trends.get('repeated_themes', [])[:8]:
-                theme_name = theme.get('theme') or theme.get('keyword', '')
-                count = theme.get('frequency') or theme.get('count', 0)
-                meetings = theme.get('meetings', [])
-                st.write(f"**{theme_name}** — Count: {count}")
-                if meetings:
-                    st.caption(f"Meetings: {', '.join(meetings)}")
+st.markdown("---")
 
-        with col2:
-            st.subheader("📅 Topic Timeline")
-            for entry in trends.get('timeline', []):
-                kws = entry.get('top_keywords') or entry.get('new_topics', [])
-                st.write(f"**[{entry.get('date', '')}] {entry.get('meeting_id')}**")
-                st.write(entry.get('title', ''))
-                if kws:
-                    st.caption(f"Topics: {', '.join(kws[:5])}")
-                st.divider()
-
-        # Trending keywords table
-        if trends.get('trending_keywords'):
-            st.subheader("📊 Trending Keywords")
-            import pandas as pd
-            trending_data = []
-            for kw in trends['trending_keywords'][:10]:
-                trending_data.append({
-                    "Keyword": kw['keyword'],
-                    "Meetings": kw['total_meetings'],
-                    "Trend": kw.get('trend', 'stable')
-                })
-            if trending_data:
-                st.dataframe(pd.DataFrame(trending_data), use_container_width=True)
-
-    # ─── ADD MEETING ────────────────────────────────────────────
-    elif "Add Meeting" in page:
-        st.title("📝 Add New Meeting")
-        st.caption("Paste a transcript to add it to the memory system")
-
-        with st.form("add_meeting_form"):
-            col1, col2 = st.columns(2)
-            with col1:
-                meeting_id = st.text_input("Meeting ID", placeholder="M005")
-                title = st.text_input("Title", placeholder="Weekly Lab Meeting")
-            with col2:
-                date = st.date_input("Date")
-                attendees = st.text_input("Attendees (comma-separated)",
-                                         placeholder="Dr. Sharma, Priya, Raju")
-
-            transcript = st.text_area(
-                "Meeting Transcript",
-                placeholder="Dr. Sharma: Today we discuss...\nPriya: I've been working on...",
-                height=300
-            )
-
-            submitted = st.form_submit_button("Add Meeting to Memory", type="primary")
-
-            if submitted and transcript:
-                new_meeting = {
-                    "meeting_id": meeting_id or "NEW001",
-                    "date": str(date),
-                    "title": title or "Untitled Meeting",
-                    "attendees": [a.strip() for a in attendees.split(",") if a.strip()],
-                    "transcript": transcript
-                }
-
-                all_meetings = [
-                    {"meeting_id": pm.meeting_id, "date": pm.date,
-                     "title": pm.title, "attendees": pm.attendees,
-                     "transcript": pm.raw_transcript}
-                    for pm in system.processed_meetings
-                ] + [new_meeting]
-
-                with st.spinner("Re-indexing with new meeting..."):
-                    summary = system.ingest_meetings(all_meetings, chunk_level="sentence")
-                    st.session_state.summary = summary
-                    st.cache_data.clear()
-
-                st.success(f"✅ Meeting {meeting_id} added! "
-                          f"Now {summary['meetings_ingested']} meetings indexed.")
-
-
-if __name__ == "__main__":
-    main()
+st.caption("Built using Streamlit + Sentence Transformers + FAISS + HuggingFace + Scikit-learn")
