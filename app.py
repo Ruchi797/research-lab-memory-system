@@ -1,451 +1,534 @@
+app.py — Streamlit Web App for Research Lab Meeting Memory System
+
+Tabs:
+  1. Upload & Process   → Upload JSON / paste transcript, rebuild index
+  2. Meeting Insights   → Per-meeting: keywords, entities, papers, deadlines
+  3. Semantic Search    → Query-based chunk retrieval
+  4. Q&A (RAG)          → Natural language Q&A over all meetings
+  5. Cross-Meeting Trends → Clusters + recurring ideas
+
+Run: streamlit run app.py
+"""
+
+import json
+import sys
+import time
+import logging
+from pathlib import Path
+
 import streamlit as st
-import pandas as pd
-import numpy as np
-import faiss-cpu
-import re
-from datetime import datetime
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.cluster import KMeans
 
-# =========================================================
-# PAGE CONFIG
-# =========================================================
+# ── Path setup ───────────────────────────────────────────────────────────────
+ROOT = Path(__file__).parent
+sys.path.insert(0, str(ROOT))
 
+logging.basicConfig(level=logging.INFO)
+
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Research Lab Meeting Memory System",
+    page_title="Research Lab Memory System",
     page_icon="🧠",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# =========================================================
-# CUSTOM CSS
-# =========================================================
-
+# ── Custom CSS ────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
-.main-title {
-    font-size: 42px;
-    font-weight: bold;
-    color: #4F46E5;
-}
-
-.card {
-    padding: 1rem;
-    border-radius: 12px;
-    background-color: #F9FAFB;
-    margin-bottom: 1rem;
-    border-left: 5px solid #4F46E5;
-}
-
-.keyword {
-    display: inline-block;
-    background-color: #E0E7FF;
-    padding: 5px 10px;
-    border-radius: 15px;
-    margin: 4px;
-    color: #3730A3;
-    font-size: 14px;
-}
-
-.answer-box {
-    background-color: #ECFDF5;
-    padding: 1rem;
-    border-radius: 10px;
-    border-left: 5px solid #10B981;
-}
+    .main-header {
+        font-size: 2rem;
+        font-weight: 700;
+        color: #1a1a2e;
+        margin-bottom: 0.25rem;
+    }
+    .sub-header {
+        font-size: 0.95rem;
+        color: #555;
+        margin-bottom: 1.5rem;
+    }
+    .metric-card {
+        background: #f8f9fc;
+        border-radius: 8px;
+        padding: 1rem;
+        border-left: 4px solid #4f46e5;
+    }
+    .keyword-tag {
+        display: inline-block;
+        background: #e0e7ff;
+        color: #3730a3;
+        padding: 2px 8px;
+        border-radius: 12px;
+        font-size: 0.8rem;
+        margin: 2px;
+    }
+    .deadline-badge {
+        background: #fef3c7;
+        border-left: 3px solid #f59e0b;
+        padding: 0.4rem 0.75rem;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.85rem;
+        margin: 4px 0;
+    }
+    .paper-badge {
+        background: #ecfdf5;
+        border-left: 3px solid #10b981;
+        padding: 0.4rem 0.75rem;
+        border-radius: 0 6px 6px 0;
+        font-size: 0.85rem;
+        margin: 4px 0;
+    }
+    .search-result {
+        background: white;
+        border: 1px solid #e5e7eb;
+        border-radius: 8px;
+        padding: 1rem;
+        margin: 0.5rem 0;
+    }
+    .trend-card {
+        background: #faf5ff;
+        border: 1px solid #d8b4fe;
+        border-radius: 8px;
+        padding: 0.75rem;
+        margin: 0.5rem 0;
+    }
+    .answer-box {
+        background: #f0fdf4;
+        border: 1px solid #86efac;
+        border-radius: 8px;
+        padding: 1.25rem;
+        font-size: 1rem;
+        line-height: 1.6;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        font-weight: 600;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# =========================================================
-# HEADER
-# =========================================================
 
-st.markdown('<div class="main-title">🧠 Research Lab Meeting Memory System</div>', unsafe_allow_html=True)
+# ── Session state init ────────────────────────────────────────────────────────
+def init_session():
+    if "pipeline" not in st.session_state:
+        st.session_state.pipeline = None
+    if "pipeline_ready" not in st.session_state:
+        st.session_state.pipeline_ready = False
+    if "search_results" not in st.session_state:
+        st.session_state.search_results = []
+    if "qa_history" not in st.session_state:
+        st.session_state.qa_history = []
 
-st.write("AI-powered meeting intelligence system using NLP + Semantic Search + RAG")
 
-# =========================================================
-# SAMPLE DATA
-# =========================================================
+init_session()
 
-@st.cache_data
-def load_data():
 
-    meetings = [
-        {
-            "id": "meeting_001",
-            "date": "2026-05-01",
-            "title": "RAG Pipeline Discussion",
-            "transcript": """
-            Today we discussed FAISS vector databases and retrieval augmented generation.
-            Deadline for conference submission is June 10.
-            Research idea includes semantic search optimization.
-            Paper discussed: Attention Is All You Need.
-            """
-        },
-
-        {
-            "id": "meeting_002",
-            "date": "2026-05-04",
-            "title": "Multilingual NLP Meeting",
-            "transcript": """
-            Team explored multilingual BERT and cross-lingual transfer learning.
-            We will perform experiments on Hindi and Marathi datasets.
-            Deadline for experiments is next Friday.
-            """
-        },
-
-        {
-            "id": "meeting_003",
-            "date": "2026-05-08",
-            "title": "Evaluation Metrics Meeting",
-            "transcript": """
-            Discussion about F1 score, precision, recall and BLEU metrics.
-            We also discussed dashboard visualization for model evaluation.
-            """
-        },
-
-        {
-            "id": "meeting_004",
-            "date": "2026-05-11",
-            "title": "Research Planning Session",
-            "transcript": """
-            Discussed future AI agents and autonomous systems.
-            Team members will work on LangChain pipelines and RAG applications.
-            Important paper: ReAct prompting paper.
-            Deadline for prototype is June 20.
-            """
-        }
-    ]
-
-    return meetings
-
-meetings = load_data()
-
-# =========================================================
-# LOAD MODELS
-# =========================================================
-
-@st.cache_resource
-def load_embedding_model():
-    return SentenceTransformer("all-MiniLM-L6-v2")
-
-@st.cache_resource
-def load_summarizer():
-    return pipeline(
-        "summarization",
-        model="facebook/bart-large-cnn"
+# ── Pipeline loader (cached) ─────────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def load_pipeline(llm_mode: str = "local"):
+    """Load the full pipeline (cached across reruns)."""
+    from pipeline import ResearchMemoryPipeline
+    pipe = ResearchMemoryPipeline(
+        data_dir=str(ROOT / "data"),
+        llm_mode=llm_mode,
     )
+    pipe.load(str(ROOT / "data" / "meetings.json"))
+    return pipe
 
-embedder = load_embedding_model()
-summarizer = load_summarizer()
 
-# =========================================================
-# VECTOR DATABASE
-# =========================================================
+# ── Header ────────────────────────────────────────────────────────────────────
+st.markdown('<div class="main-header">🧠 Research Lab Meeting Memory System</div>', unsafe_allow_html=True)
+st.markdown('<div class="sub-header">Extract insights, search semantically, and ask questions across your research meetings.</div>', unsafe_allow_html=True)
 
-texts = [m["transcript"] for m in meetings]
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    llm_mode = st.selectbox(
+        "LLM Mode",
+        ["local", "openai"],
+        help="'local' uses flan-t5 (no API key). 'openai' uses GPT-3.5 (needs OPENAI_API_KEY)."
+    )
+    top_k = st.slider("Search Top-K results", 3, 10, 5)
+    st.markdown("---")
+    st.markdown("### 📂 Data")
+    st.markdown("Default: `data/meetings.json`")
 
-embeddings = embedder.encode(texts)
+    if st.button("🔄 Rebuild Index", use_container_width=True):
+        st.cache_resource.clear()
+        st.session_state.pipeline_ready = False
+        st.rerun()
 
-dimension = embeddings.shape[1]
+    st.markdown("---")
+    st.markdown("### 📊 Status")
+    if st.session_state.pipeline_ready:
+        pipe = st.session_state.pipeline
+        st.success(f"✅ {len(pipe.meetings)} meetings loaded")
+        st.info(f"🔍 {pipe.embedder.index.ntotal} chunks indexed")
+    else:
+        st.warning("⏳ Loading pipeline...")
 
-index = faiss.IndexFlatL2(dimension)
+# ── Auto-load pipeline ────────────────────────────────────────────────────────
+if not st.session_state.pipeline_ready:
+    with st.spinner("Loading pipeline... (first run downloads embedding model ~90MB)"):
+        try:
+            pipe = load_pipeline(llm_mode)
+            st.session_state.pipeline = pipe
+            st.session_state.pipeline_ready = True
+            st.rerun()
+        except Exception as e:
+            st.error(f"Pipeline load failed: {e}")
+            st.stop()
 
-index.add(np.array(embeddings).astype("float32"))
+pipe = st.session_state.pipeline
 
-# =========================================================
-# SIDEBAR
-# =========================================================
-
-st.sidebar.title("⚙️ Settings")
-
-top_k = st.sidebar.slider(
-    "Search Results",
-    min_value=1,
-    max_value=5,
-    value=3
-)
-
-st.sidebar.markdown("---")
-
-st.sidebar.success(f"✅ Meetings Loaded: {len(meetings)}")
-
-st.sidebar.info(f"🔍 Vector Chunks Indexed: {index.ntotal}")
-
-# =========================================================
-# TABS
-# =========================================================
-
-tab1, tab2, tab3, tab4 = st.tabs([
+# ── Main tabs ─────────────────────────────────────────────────────────────────
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📋 Meeting Insights",
     "🔍 Semantic Search",
-    "💬 RAG Q&A",
-    "📈 Clustering & Trends"
+    "💬 Q&A (RAG)",
+    "📈 Trends & Clusters",
+    "➕ Add Meeting",
 ])
 
-# =========================================================
-# TAB 1
-# =========================================================
 
+# ════════════════════════════════════════════════════════════
+# TAB 1: Meeting Insights
+# ════════════════════════════════════════════════════════════
 with tab1:
+    st.markdown("### 📋 Meeting Insights")
 
-    st.subheader("📋 Meeting Insights")
+    meeting_options = {m["id"]: f"{m['date']} — {m['title']}" for m in pipe.meetings}
+    selected_id = st.selectbox("Select a meeting", list(meeting_options.keys()),
+                                format_func=lambda x: meeting_options[x])
 
-    titles = [m["title"] for m in meetings]
+    if selected_id:
+        m = pipe.get_meeting_insights(selected_id)
+        if m:
+            st.markdown(f"#### {m['title']}")
+            st.caption(f"📅 {m['date']} | {len(m.get('sentences', []))} sentences | {len(m.get('chunks', []))} chunks")
 
-    selected_title = st.selectbox(
-        "Select Meeting",
-        titles
-    )
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Keywords", len(m.get("keywords", [])))
+            col2.metric("Papers", len(m.get("papers_discussed", [])))
+            col3.metric("Deadlines", len(m.get("deadlines", [])))
+            col4.metric("Key Ideas", len(m.get("key_ideas", [])))
 
-    meeting = next(
-        m for m in meetings
-        if m["title"] == selected_title
-    )
+            # Summary
+            st.markdown("**📝 Summary**")
+            summary = m.get("summary", "No summary available.")
+            st.info(summary)
 
-    col1, col2 = st.columns(2)
+            # Two columns for details
+            left, right = st.columns(2)
 
-    with col1:
+            with left:
+                # Keywords
+                st.markdown("**🏷️ Keywords (TF-IDF)**")
+                kw_html = " ".join([
+                    f'<span class="keyword-tag">{kw} ({score})</span>'
+                    for kw, score in m.get("keywords", [])[:10]
+                ])
+                st.markdown(kw_html, unsafe_allow_html=True)
 
-        st.markdown("### 📅 Date")
-        st.info(meeting["date"])
+                # Research topics
+                st.markdown("**🔬 Research Topics**")
+                topics = m.get("research_topics", [])
+                if topics:
+                    for t in topics:
+                        st.markdown(f"- {t}")
+                else:
+                    st.caption("None detected")
 
-        st.markdown("### 📝 Transcript")
+                # Named entities
+                st.markdown("**👤 Named Entities**")
+                entities = m.get("entities", {})
+                if any(entities.values()):
+                    for etype, values in entities.items():
+                        if values:
+                            st.caption(f"**{etype}**: {', '.join(values)}")
+                else:
+                    st.caption("None detected")
 
-        st.markdown(
-            f"""
-            <div class="card">
-            {meeting["transcript"]}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
+            with right:
+                # Papers
+                st.markdown("**📄 Papers Discussed**")
+                papers = m.get("papers_discussed", [])
+                if papers:
+                    for p in papers:
+                        st.markdown(f'<div class="paper-badge">📎 {p}</div>', unsafe_allow_html=True)
+                else:
+                    st.caption("None detected")
 
-    with col2:
+                # Deadlines
+                st.markdown("**⏰ Deadlines**")
+                deadlines = m.get("deadlines", [])
+                if deadlines:
+                    for d in deadlines:
+                        st.markdown(f'<div class="deadline-badge">📌 {d}</div>', unsafe_allow_html=True)
+                else:
+                    st.caption("None detected")
 
-        st.markdown("### 📌 AI Summary")
+                # Key ideas
+                st.markdown("**💡 Key Ideas**")
+                ideas = m.get("key_ideas", [])
+                if ideas:
+                    for idea in ideas:
+                        st.markdown(f"> {idea}")
+                else:
+                    st.caption("None detected")
 
-        try:
-            summary = summarizer(
-                meeting["transcript"],
-                max_length=60,
-                min_length=20,
-                do_sample=False
-            )
+            # Full transcript expander
+            with st.expander("📜 Full Transcript"):
+                st.text(m.get("clean_text", ""))
 
-            st.success(summary[0]["summary_text"])
 
-        except:
-            st.warning("Summary model loading...")
-
-        st.markdown("### 🏷️ Keywords")
-
-        vectorizer = TfidfVectorizer(
-            stop_words="english"
-        )
-
-        X = vectorizer.fit_transform(
-            [meeting["transcript"]]
-        )
-
-        keywords = zip(
-            vectorizer.get_feature_names_out(),
-            X.toarray()[0]
-        )
-
-        sorted_keywords = sorted(
-            keywords,
-            key=lambda x: x[1],
-            reverse=True
-        )[:10]
-
-        for word, score in sorted_keywords:
-
-            st.markdown(
-                f'<span class="keyword">{word}</span>',
-                unsafe_allow_html=True
-            )
-
-        st.markdown("### ⏰ Deadlines")
-
-        deadline_pattern = r"(June \d+|next Friday|June \d+)"
-
-        deadlines = re.findall(
-            deadline_pattern,
-            meeting["transcript"]
-        )
-
-        if deadlines:
-            for d in deadlines:
-                st.warning(f"📌 {d}")
-        else:
-            st.info("No deadlines found")
-
-# =========================================================
-# TAB 2
-# =========================================================
-
+# ════════════════════════════════════════════════════════════
+# TAB 2: Semantic Search
+# ════════════════════════════════════════════════════════════
 with tab2:
-
-    st.subheader("🔍 Semantic Search")
+    st.markdown("### 🔍 Semantic Search")
+    st.caption("Find the most relevant meeting passages for any query using sentence embeddings.")
 
     query = st.text_input(
-        "Search meetings",
-        placeholder="e.g. multilingual BERT"
+        "Search query",
+        placeholder="e.g. multilingual BERT cross-lingual transfer",
+        key="search_query"
     )
 
-    if st.button("Search"):
+    col_a, col_b = st.columns([1, 5])
+    search_btn = col_a.button("🔍 Search", use_container_width=True)
 
-        query_embedding = embedder.encode([query])
+    if search_btn and query:
+        with st.spinner("Searching..."):
+            results = pipe.search(query, top_k=top_k)
+            st.session_state.search_results = results
 
-        distances, indices = index.search(
-            np.array(query_embedding).astype("float32"),
-            top_k
-        )
+    if st.session_state.search_results:
+        results = st.session_state.search_results
+        st.markdown(f"**{len(results)} results** for *'{query or 'last query'}'*")
 
-        st.markdown("## 📚 Results")
+        for i, r in enumerate(results, 1):
+            with st.container():
+                score_pct = int(r["score"] * 100)
+                score_color = "#16a34a" if score_pct > 70 else "#ca8a04" if score_pct > 40 else "#dc2626"
+                st.markdown(
+                    f'<div class="search-result">'
+                    f'<b>#{i}</b> &nbsp; '
+                    f'<span style="color:{score_color}">▶ {score_pct}% match</span> &nbsp; | &nbsp; '
+                    f'📅 <b>{r["date"]}</b> — {r["meeting_title"]}<br><br>'
+                    f'{r["chunk"]}'
+                    f'</div>',
+                    unsafe_allow_html=True
+                )
 
-        for idx in indices[0]:
+    # Quick search suggestions
+    st.markdown("**Try these queries:**")
+    suggestions = [
+        "RAG pipeline FAISS retrieval",
+        "deadline submission conference",
+        "cross-lingual multilingual model",
+        "data augmentation back-translation",
+        "evaluation metrics F1 score",
+    ]
+    cols = st.columns(len(suggestions))
+    for col, sug in zip(cols, suggestions):
+        if col.button(sug, key=f"sug_{sug[:10]}"):
+            with st.spinner("Searching..."):
+                st.session_state.search_results = pipe.search(sug, top_k=top_k)
+            st.rerun()
 
-            result = meetings[idx]
 
-            st.markdown(
-                f"""
-                <div class="card">
-                <h4>{result['title']}</h4>
-                <b>Date:</b> {result['date']} <br><br>
-                {result['transcript']}
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
-
-# =========================================================
-# TAB 3
-# =========================================================
-
+# ════════════════════════════════════════════════════════════
+# TAB 3: Q&A (RAG)
+# ════════════════════════════════════════════════════════════
 with tab3:
-
-    st.subheader("💬 Ask Questions Across Meetings")
+    st.markdown("### 💬 Q&A over Meeting History")
+    st.caption("Ask natural language questions. The system retrieves relevant context and generates an answer.")
 
     question = st.text_area(
-        "Enter your question",
-        placeholder="What deadlines were discussed?"
+        "Your question",
+        placeholder="e.g. What papers were discussed related to attention mechanisms?",
+        height=80,
+        key="rag_question"
     )
 
-    if st.button("Generate Answer"):
+    ask_col, clear_col = st.columns([1, 5])
+    ask_btn = ask_col.button("💬 Ask", use_container_width=True)
 
-        question_embedding = embedder.encode([question])
+    if ask_btn and question:
+        with st.spinner("Retrieving context and generating answer..."):
+            result = pipe.ask(question)
 
-        distances, indices = index.search(
-            np.array(question_embedding).astype("float32"),
-            2
-        )
+        # Add to history
+        st.session_state.qa_history.insert(0, result)
 
-        retrieved_docs = []
+    if clear_col.button("🗑️ Clear history"):
+        st.session_state.qa_history = []
+        st.rerun()
 
-        for idx in indices[0]:
-            retrieved_docs.append(
-                meetings[idx]["transcript"]
-            )
+    # Display Q&A history
+    for i, result in enumerate(st.session_state.qa_history):
+        st.markdown(f"**Q: {result['question']}**")
+        st.markdown(f'<div class="answer-box">{result["answer"]}</div>', unsafe_allow_html=True)
 
-        context = "\n".join(retrieved_docs)
+        with st.expander(f"📚 Sources ({len(result.get('sources', []))})"):
+            for s in result.get("sources", []):
+                st.markdown(
+                    f"**{s['meeting_title']}** ({s['date']}) — score: {s['score']}\n\n"
+                    f"*{s['chunk']}*"
+                )
+        st.markdown("---")
 
-        answer = f"""
-        Based on retrieved meetings:
-
-        {context}
-        """
-
-        st.markdown(
-            f"""
-            <div class="answer-box">
-            {answer}
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-# =========================================================
-# TAB 4
-# =========================================================
-
-with tab4:
-
-    st.subheader("📈 Semantic Clustering")
-
-    num_clusters = st.slider(
-        "Number of Clusters",
-        2,
-        4,
-        2
-    )
-
-    kmeans = KMeans(
-        n_clusters=num_clusters,
-        random_state=42
-    )
-
-    cluster_labels = kmeans.fit_predict(embeddings)
-
-    cluster_df = pd.DataFrame({
-        "Meeting": [m["title"] for m in meetings],
-        "Cluster": cluster_labels
-    })
-
-    st.dataframe(cluster_df)
-
-    st.markdown("### 🔁 Cluster Insights")
-
-    for cluster in sorted(cluster_df["Cluster"].unique()):
-
-        st.markdown(f"## Cluster {cluster}")
-
-        cluster_meetings = cluster_df[
-            cluster_df["Cluster"] == cluster
+    # Sample questions
+    if not st.session_state.qa_history:
+        st.markdown("**Sample questions to try:**")
+        sample_qs = [
+            "What are all the deadlines mentioned across meetings?",
+            "Which papers were cited in multiple meetings?",
+            "What is the RAG pipeline architecture discussed?",
+            "What recurring research topics came up?",
+            "Who are the team members and what are their action items?",
         ]
+        for q in sample_qs:
+            st.markdown(f"- *{q}*")
 
-        for m in cluster_meetings["Meeting"]:
-            st.success(m)
 
-# =========================================================
-# ADD NEW MEETING
-# =========================================================
+# ════════════════════════════════════════════════════════════
+# TAB 4: Trends & Clusters
+# ════════════════════════════════════════════════════════════
+with tab4:
+    st.markdown("### 📈 Cross-Meeting Trends & Idea Clusters")
 
-st.markdown("---")
+    # Summary metrics
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Clusters", len(pipe.clusters))
+    m2.metric("Recurring Trends", len(pipe.trends))
+    m3.metric("Repeated Ideas", len(pipe.repeated_ideas))
 
-st.subheader("➕ Add New Meeting")
+    st.markdown("---")
 
-with st.form("meeting_form"):
+    # Clusters
+    st.markdown("#### 🗂️ Semantic Clusters")
+    st.caption("Chunks grouped by semantic similarity using KMeans on embeddings.")
 
-    title = st.text_input("Meeting Title")
+    for cluster in pipe.clusters:
+        badge = "🔁 Recurring" if len(cluster["meetings"]) >= 2 else "📌 Single-meeting"
+        with st.expander(
+            f"Cluster {cluster['cluster_id']}: **{cluster['label']}** "
+            f"({cluster['size']} chunks, {len(cluster['meetings'])} meetings) {badge}"
+        ):
+            st.caption(f"**Meetings**: {', '.join(cluster['meetings'])}")
+            for chunk in cluster["chunks"][:3]:
+                st.markdown(f"> {chunk[:200]}...")
+            if cluster["size"] > 3:
+                st.caption(f"... and {cluster['size'] - 3} more chunks")
 
-    date = st.date_input("Meeting Date")
+    st.markdown("---")
 
-    transcript = st.text_area("Transcript")
+    # Trends
+    if pipe.trends:
+        st.markdown("#### 🔁 Recurring Themes (across 2+ meetings)")
+        for t in pipe.trends:
+            st.markdown(
+                f'<div class="trend-card">'
+                f'<b>{t["label"]}</b><br>'
+                f'Appears in {t["trend_strength"]} meetings: {", ".join(t["meetings"])}'
+                f'</div>',
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No trends detected yet. Add more meetings to detect patterns.")
 
-    submitted = st.form_submit_button("Add Meeting")
+    st.markdown("---")
+
+    # Repeated ideas
+    if pipe.repeated_ideas:
+        st.markdown("#### 💡 Repeated Ideas (similar content across meetings)")
+        for idea in pipe.repeated_ideas[:5]:
+            with st.expander(
+                f"Idea discussed in {idea['occurrences']} meetings "
+                f"(avg similarity: {idea['avg_similarity']:.0%})"
+            ):
+                st.caption(f"Meetings: {', '.join(idea['meetings'])}")
+                for chunk in idea["chunks"]:
+                    st.markdown(f"> {chunk[:200]}...")
+    else:
+        st.info("No repeated ideas detected at current similarity threshold (0.80).")
+
+
+# ════════════════════════════════════════════════════════════
+# TAB 5: Add Meeting
+# ════════════════════════════════════════════════════════════
+with tab5:
+    st.markdown("### ➕ Add New Meeting")
+    st.caption("Paste a new transcript or upload a JSON file to expand the corpus.")
+
+    with st.form("add_meeting_form"):
+        new_id = st.text_input("Meeting ID", placeholder="meeting_006")
+        new_date = st.date_input("Meeting Date")
+        new_title = st.text_input("Meeting Title", placeholder="Weekly Research Sync")
+        new_transcript = st.text_area(
+            "Transcript / Notes",
+            placeholder="Paste meeting transcript here...",
+            height=200
+        )
+        submitted = st.form_submit_button("➕ Add to Corpus")
 
     if submitted:
+        if not (new_id and new_title and new_transcript):
+            st.error("Meeting ID, title, and transcript are required.")
+        else:
+            # Load existing data
+            data_path = ROOT / "data" / "meetings.json"
+            with open(data_path, "r") as f:
+                existing = json.load(f)
 
-        new_meeting = {
-            "id": f"meeting_{len(meetings)+1}",
-            "date": str(date),
-            "title": title,
-            "transcript": transcript
-        }
+            # Check for duplicate ID
+            if any(m["id"] == new_id for m in existing):
+                st.error(f"Meeting ID '{new_id}' already exists. Use a different ID.")
+            else:
+                new_meeting = {
+                    "id": new_id,
+                    "date": str(new_date),
+                    "title": new_title,
+                    "transcript": new_transcript,
+                }
+                existing.append(new_meeting)
 
-        meetings.append(new_meeting)
+                with open(data_path, "w") as f:
+                    json.dump(existing, f, indent=2)
 
-        st.success("✅ Meeting Added Successfully!")
+                st.success(f"Meeting '{new_title}' added. Rebuilding index...")
+                st.cache_resource.clear()
+                st.session_state.pipeline_ready = False
+                time.sleep(1)
+                st.rerun()
 
-# =========================================================
-# FOOTER
-# =========================================================
+    st.markdown("---")
+    st.markdown("**Or upload a JSON file** (same format as `data/meetings.json`):")
+    uploaded = st.file_uploader("Upload meetings JSON", type=["json"])
+    if uploaded:
+        try:
+            new_meetings = json.load(uploaded)
+            if not isinstance(new_meetings, list):
+                new_meetings = [new_meetings]
 
-st.markdown("---")
+            data_path = ROOT / "data" / "meetings.json"
+            with open(data_path, "r") as f:
+                existing = json.load(f)
 
-st.caption("Built using Streamlit + Sentence Transformers + FAISS + HuggingFace + Scikit-learn")
+            existing_ids = {m["id"] for m in existing}
+            added = [m for m in new_meetings if m["id"] not in existing_ids]
+            existing.extend(added)
+
+            with open(data_path, "w") as f:
+                json.dump(existing, f, indent=2)
+
+            st.success(f"Added {len(added)} meetings. Rebuilding index...")
+            st.cache_resource.clear()
+            st.session_state.pipeline_ready = False
+            time.sleep(1)
+            st.rerun()
+        except json.JSONDecodeError:
+            st.error("Invalid JSON file.")
