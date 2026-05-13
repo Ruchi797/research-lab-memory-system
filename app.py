@@ -466,6 +466,6 @@ with st.form("meeting_form"):
 
 st.markdown("---")
 st.caption(
-    "Built using Streamlit + Sentence Transformers + FAISS + Scikit-learn"
+    "Built using Streamlit + Sentence Transformers + FAISS + Scikit-learn")
 
 
