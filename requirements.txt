@@ -2,7 +2,7 @@ streamlit
 pandas
 numpy
 spacy
-sckit-learn
+scikit-learn
 sentence-transformers
 transformers
 faiss-cpu
