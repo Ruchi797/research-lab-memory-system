@@ -1,11 +1,11 @@
 #Streamlit Web App for Research Lab Meeting Memory System
 
 Tabs:
-  1. Upload & Process   -> Upload JSON / paste transcript, rebuild index
-  2. Meeting Insights   ->Per-meeting: keywords, entities, papers, deadlines
-  3. Semantic Search    -> Query-based chunk retrieval
-  4. Q&A (RAG)          -> Natural language Q&A over all meetings
-  5. Cross-Meeting Trends → Clusters + recurring ideas
+  #1. Upload & Process   -> Upload JSON / paste transcript, rebuild index
+  #2. Meeting Insights   ->Per-meeting: keywords, entities, papers, deadlines
+  #3. Semantic Search    -> Query-based chunk retrieval
+  #4. Q&A (RAG)          -> Natural language Q&A over all meetings
+  #5. Cross-Meeting Trends → Clusters + recurring ideas
 
 Run: streamlit run app.py
 """
