@@ -1,4 +1,4 @@
-app.py — Streamlit Web App for Research Lab Meeting Memory System
+#Streamlit Web App for Research Lab Meeting Memory System
 
 Tabs:
   1. Upload & Process   → Upload JSON / paste transcript, rebuild index
