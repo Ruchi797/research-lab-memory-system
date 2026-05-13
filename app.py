@@ -134,13 +134,14 @@ def load_embedding_model():
 
 @st.cache_resource
 # def load_summarizer():
- #  return pipeline(
-  #      "summarization",
-   #     model="facebook/bart-large-cnn"
-    #)
+#   return pipeline(
+#        "summarization",
+#        model="facebook/bart-large-cnn"
+#   )
 
-embedder = load_embedding_model()
+
 # summarizer = load_summarizer()
+embedder = load_embedding_model()
 
 # =========================================================
 # VECTOR DATABASE
