@@ -8,3 +8,5 @@ transformers
 faiss-cpu
 langchain
 torch
+nltk
+python-dotenv
