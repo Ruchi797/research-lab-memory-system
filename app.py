@@ -133,14 +133,14 @@ def load_embedding_model():
     return SentenceTransformer("all-MiniLM-L6-v2")
 
 @st.cache_resource
-def load_summarizer():
-    return pipeline(
-        "summarization",
-        model="facebook/bart-large-cnn"
-    )
+# def load_summarizer():
+ #  return pipeline(
+  #      "summarization",
+   #     model="facebook/bart-large-cnn"
+    #)
 
 embedder = load_embedding_model()
-summarizer = load_summarizer()
+# summarizer = load_summarizer()
 
 # =========================================================
 # VECTOR DATABASE
